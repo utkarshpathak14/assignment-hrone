@@ -1,0 +1,11 @@
+# secrets / local config
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# kit document that must not be published (see HROne email)
+PROBLEM_STATEMENT.docx
