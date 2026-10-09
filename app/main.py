@@ -10,14 +10,14 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Annotated, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import AfterValidator, BaseModel, Field, model_validator
 from pymongo import MongoClient
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 # override=False (the default): a real environment variable always wins over a value in .env.
 load_dotenv()
@@ -32,10 +32,15 @@ client = MongoClient(
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def ensure_indexes() -> None:
     """Create every index the app relies on. create_index is idempotent, so running it on every start is safe."""
+    # Unique: enforces one employee per emp_code even under concurrent creates.
+    db.employees.create_index("emp_code", unique=True)
+    # GET /employees?department=X sorted by emp_code: equality field first, then the sort field.
+    db.employees.create_index([("department", 1), ("emp_code", 1)])
 
 
 @asynccontextmanager
@@ -50,6 +55,27 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def to_ms(dt: Optional[datetime]) -> Optional[int]:
+    """Aware datetime -> epoch milliseconds (exact integer maths, no float rounding)."""
+    if dt is None:
+        return None
+    return (dt - EPOCH) // timedelta(milliseconds=1)
+
+
+def serialize_employee(doc: dict) -> dict:
+    """MongoDB employee document -> API shape: no _id, created_at as epoch ms."""
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc.get("name"),
+        "email": doc.get("email"),
+        "department": doc.get("department"),
+        "shift_start": doc.get("shift_start"),
+        "shift_end": doc.get("shift_end"),
+        "joined_on": doc.get("joined_on"),
+        "created_at": to_ms(doc.get("created_at")),
+    }
+
+
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -70,14 +96,32 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
-class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+def _real_date(value: str) -> str:
+    date.fromisoformat(value)  # raises ValueError for impossible dates such as 2026-02-30
+    return value
+
+
+# Reusable constrained types. [0-9] instead of \d: \d also matches non-ASCII digits.
+DateStr = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"), AfterValidator(_real_date)]
+TimeHHMM = Annotated[str, Field(pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")]
+Page = Annotated[int, Query(ge=1)]
+PageSize = Annotated[int, Query(ge=1, le=100)]
+
+
+class EmployeeCreate(BaseModel):
+    emp_code: str = Field(pattern=r"^EMP[0-9]{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: TimeHHMM = "09:30"
+    shift_end: TimeHHMM = "18:30"
+    joined_on: DateStr
+
+    @model_validator(mode="after")
+    def shift_has_length(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 
 class PunchInIn(BaseModel):
@@ -99,24 +143,25 @@ def health():
 
 
 @app.post("/employees", status_code=201)
-def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
+def create_employee(body: EmployeeCreate):
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = datetime.now(timezone.utc)
+    try:
+        # No find_one pre-check: the unique index decides, atomically, who wins a concurrent create.
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+    return serialize_employee(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(department: Optional[str] = None, page: Page = 1, page_size: PageSize = 20):
     q = {}
-    if department:
+    if department is not None:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
+    total = db.employees.count_documents(q)
+    cursor = db.employees.find(q).sort("emp_code", 1).skip((page - 1) * page_size).limit(page_size)
+    items = [serialize_employee(doc) for doc in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
