@@ -734,8 +734,103 @@ def late_leaderboard(month: MonthStr, limit: Limit = 10, department: Optional[st
     return {"month": month, "items": items}
 
 
+MAX_TREND_DAYS = 92
+
+
+def trend_range(start: str, end: str) -> tuple[date, date]:
+    first, last = date.fromisoformat(start), date.fromisoformat(end)
+    if last < first:
+        raise unprocessable("query", "to", "to must be on or after from")
+    if (last - first).days + 1 > MAX_TREND_DAYS:
+        raise unprocessable("query", "to", f"the range can not exceed {MAX_TREND_DAYS} days")
+    return first, last
+
+
+def department_trend_pipeline(department: str, first: date, last: date) -> list:
+    """GET /analytics/departments/{department}/trend: one row per calendar day, gap-filled with $densify."""
+    first_dt = datetime.combine(first, time(), tzinfo=timezone.utc)
+    last_dt = datetime.combine(last, time(), tzinfo=timezone.utc)
+    empty_day = {"present_count": 0, "late_count": 0}
+    return [
+        {"$match": {"department": department}},
+        logs_lookup({"$gte": first.isoformat(), "$lte": last.isoformat()},
+                    ("date", "status", "late_minutes", "half_day")),
+        {"$unwind": "$logs"},
+        # Per-day totals over the department's records (any weekday or weekend).
+        {"$group": {
+            "_id": "$logs.date",
+            "present_count": {"$sum": {"$cond": [is_presence("$logs."), day_credit("$logs."), 0]}},
+            "late_count": {"$sum": count_if({"$gt": [late_of("$logs."), 0]})},
+        }},
+        {"$project": {"_id": 0, "present_count": 1, "late_count": 1,
+                      "day": {"$dateFromString": {"dateString": "$_id", "format": "%Y-%m-%d"}}}},
+        # Add both ends of the range, so $densify has bounds to fill between even when there are no records.
+        {"$unionWith": {"pipeline": [{"$documents": [{"day": first_dt, **empty_day}, {"day": last_dt, **empty_day}]}]}},
+        {"$group": {"_id": "$day", "present_count": {"$sum": "$present_count"}, "late_count": {"$sum": "$late_count"}}},
+        {"$project": {"_id": 0, "day": "$_id", "present_count": 1, "late_count": 1}},
+        # Fill every missing calendar day (the upper bound is exclusive, hence + 1 day).
+        {"$densify": {"field": "day", "range": {"step": 1, "unit": "day",
+                                                 "bounds": [first_dt, last_dt + timedelta(days=1)]}}},
+        {"$set": {
+            "date": {"$dateToString": {"date": "$day", "format": "%Y-%m-%d"}},
+            "present_count": {"$ifNull": ["$present_count", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+            "is_working_day": {"$lte": [{"$isoDayOfWeek": "$day"}, 5]},
+        }},
+        # R9 per day: department employees who had joined by that day.
+        {"$lookup": {
+            "from": "employees",
+            "let": {"day": "$date"},
+            "pipeline": [
+                {"$match": {"department": department}},
+                {"$match": {"$expr": {"$lte": ["$joined_on", "$$day"]}}},
+                {"$count": "n"},
+            ],
+            "as": "joined",
+        }},
+        {"$set": {"headcount": {"$ifNull": [{"$first": "$joined.n"}, 0]}}},
+        {"$set": {"rate": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+            round_half_up_decimal({"$divide": [{"$toDecimal": "$present_count"}, "$headcount"]}, 4),
+            None,
+        ]}}},
+        # Mean of the non-null rates in this row and up to 6 rows before it. Only rows inside the range exist,
+        # so the first rows naturally get a shorter window. $avg ignores nulls; all-null gives null.
+        {"$setWindowFields": {"sortBy": {"day": 1}, "output": {
+            "moving": {"$avg": "$rate", "window": {"documents": [-6, 0]}},
+        }}},
+        {"$sort": {"day": 1}},
+        {"$project": {
+            "_id": 0,
+            "date": 1,
+            "is_working_day": 1,
+            "headcount": 1,
+            "present_count": 1,
+            "late_count": 1,
+            "attendance_rate": {"$toDouble": "$rate"},
+            "moving_avg_7d": round_half_up("$moving", 4),
+        }},
+    ]
+
+
+def get_department_or_404(department: str) -> None:
+    if db.employees.find_one({"department": department}, {"_id": 1}) is None:
+        raise HTTPException(404, "unknown department")
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_: Annotated[DateStr, Query(alias="from")],
+    to: DateStr,
+):
+    first, last = trend_range(from_, to)
+    get_department_or_404(department)
+    items = list(db.employees.aggregate(department_trend_pipeline(department, first, last)))
+    return {"department": department, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
