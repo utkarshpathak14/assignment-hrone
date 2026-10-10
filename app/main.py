@@ -1,12 +1,16 @@
 """
-Employee Attendance & Analytics API - STARTER
+Employee Attendance & Analytics API
 
 Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
+Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience; real environment variables win)
 
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
+Layout of this file:
+  configuration & indexes -> time/rule helpers (R1-R5) -> serializers -> request models
+  -> CRUD and attendance endpoints -> analytics expression helpers -> analytics endpoints -> admin/explain
+
+openapi.yaml is the HTTP contract and DATA_MODEL.md describes what is stored in MongoDB.
+Every list/analytics endpoint builds its query in a function that /admin/explain reuses, so the
+explained query is always the one the endpoint runs.
 """
 import json
 import os
@@ -320,7 +324,7 @@ class PunchInRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Endpoints provided
+# Employee and attendance endpoints
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():

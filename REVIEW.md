@@ -1,6 +1,8 @@
 # REVIEW.md
 
-Defects found in the starter `app/main.py` (helpers and endpoints).
+Defects found in the starter `app/main.py` (helpers and endpoints): 31 in total. The fixed behaviour of each is
+pinned by tests in `tests/` (one caveat: the check-then-insert race #6 only reproduced on the starter code with 50 ms of simulated database
+latency, as on a remote cluster; against a local MongoDB the window is usually too short to hit. #22 is the same pattern).
 
 | # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
 |---|---|---|---|---|
@@ -41,3 +43,7 @@ Defects found in the starter `app/main.py` (helpers and endpoints).
 - `load_dotenv()` is called without `override=True`. That is correct: real environment variables keep priority over `.env`, as the contract requires.
 - `doc.pop("_id", None)` after `insert_one` in `create_employee`: correct, because `insert_one` adds `_id` to the dict it is given. (The new code no longer needs it: `serialize_employee` builds the response from named fields.)
 - `find(q, {"_id": 0})` in `list_employees` correctly hid `_id`; the new serializer does the same by only copying named fields.
+- `IST = timezone(timedelta(hours=5, minutes=30))` is correct (India has no daylight saving time, so a fixed offset is right).
+- Plain `def` endpoints with the synchronous PyMongo client are fine: FastAPI runs them in a thread pool and `MongoClient` is thread-safe. The concurrency problems were check-then-act races in the logic, not the threading model.
+- The helper functions were worth reusing as *names and responsibilities* (`compute_late_minutes`, `compute_work_hours`, `compute_overtime`), but not as written: all three were wrong (#13-#15, #28-#31). They now take the attendance date and the employee, so they can anchor the shift in IST and handle overnight shifts, and a single `derive()` combines them for punch-in, punch-out and corrections.
+- `status_code=201` on the two POST-create endpoints and the `{"detail": ...}` error bodies from `HTTPException` already matched the contract.
