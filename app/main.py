@@ -699,9 +699,43 @@ def department_summary(month: MonthStr, department: Optional[str] = None):
     return {"month": month, "items": items}
 
 
+Limit = Annotated[int, Query(ge=1, le=50)]
+
+
+def late_leaderboard_pipeline(month: str, limit: int, department: Optional[str]) -> list:
+    """GET /analytics/leaderboard/late. Standard competition ranking via $setWindowFields + $rank."""
+    by_department = [{"$match": {"employee.department": department}}] if department is not None else []
+    return [
+        {"$match": {"date": month_match(month), "late_minutes": {"$gt": 0}}},
+        {"$group": {"_id": "$emp_code", "total_late_minutes": {"$sum": "$late_minutes"}, "late_count": {"$sum": 1}}},
+        # Inner join with employees: $unwind drops logs whose employee does not exist.
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "employee"}},
+        {"$unwind": "$employee"},
+        *by_department,  # filter BEFORE ranking, so ranks restart inside the department
+        # $rank: ties share a rank and the next rank is skipped (1, 2, 2, 4). $denseRank would give 1, 2, 2, 3.
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
+        {"$match": {"rank": {"$lte": limit}}},  # limit applies AFTER ranking: ties at the cutoff are all kept
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "rank": 1,
+            "emp_code": "$_id",
+            "name": "$employee.name",
+            "department": "$employee.department",
+            "total_late_minutes": 1,
+            "late_count": 1,
+        }},
+    ]
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(month: MonthStr, limit: Limit = 10, department: Optional[str] = None):
+    items = list(db.attendance_logs.aggregate(late_leaderboard_pipeline(month, limit, department)))
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
