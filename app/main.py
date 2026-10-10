@@ -619,9 +619,88 @@ def employee_monthly(emp_code: str, month: MonthStr):
     }
 
 
+def logs_lookup(date_range: dict, fields: tuple) -> dict:
+    """$lookup of each employee's logs in a date range. localField/foreignField + an inner $match on date,
+    so every lookup is an index scan on the unique (emp_code, date) index."""
+    return {"$lookup": {
+        "from": "attendance_logs",
+        "localField": "emp_code",
+        "foreignField": "emp_code",
+        "pipeline": [{"$match": {"date": date_range}}, {"$project": {"_id": 0, **{f: 1 for f in fields}}}],
+        "as": "logs",
+    }}
+
+
+def sum_over_logs(expr_for_log) -> dict:
+    """Sum an expression over the embedded "logs" array of one employee."""
+    return {"$sum": {"$map": {"input": "$logs", "as": "log", "in": expr_for_log("$$log.")}}}
+
+
+def has_work_hours(p: str) -> dict:
+    return {"$and": [is_presence(p), {"$isNumber": f"{p}work_hours"}]}
+
+
+def department_summary_pipeline(month: str, department: Optional[str]) -> list:
+    """GET /analytics/departments/summary. Starts from employees, so people with zero logs still count."""
+    _, last = month_bounds(month)
+    match = {"joined_on": {"$lte": last.isoformat()}}  # R9: joined by the end of the month
+    if department is not None:
+        match = {"department": department, **match}
+    return [
+        {"$match": match},
+        logs_lookup(month_match(month), ("date", "status", "work_hours", "late_minutes", "half_day")),
+        # One document per employee with that employee's totals (an employee without logs gets zeros).
+        {"$project": {
+            "department": 1,
+            "present_days": sum_over_logs(present_days_credit),
+            "work_hours_sum": sum_over_logs(
+                lambda p: {"$cond": [has_work_hours(p), {"$toDecimal": f"{p}work_hours"}, Decimal128("0")]}),
+            "work_hours_count": sum_over_logs(lambda p: count_if(has_work_hours(p))),
+            "late_count": sum_over_logs(lambda p: count_if({"$gt": [late_of(p), 0]})),
+            "total_late_minutes": sum_over_logs(late_of),
+            "leave_count": sum_over_logs(lambda p: count_if({"$eq": [f"{p}status", "LEAVE"]})),
+            "on_duty_count": sum_over_logs(lambda p: count_if({"$eq": [f"{p}status", "ON_DUTY"]})),
+        }},
+        # One document per department. headcount = number of employee documents, with or without logs.
+        {"$group": {
+            "_id": "$department",
+            "headcount": {"$sum": 1},
+            "present_days": {"$sum": "$present_days"},
+            "work_hours_sum": {"$sum": "$work_hours_sum"},
+            "work_hours_count": {"$sum": "$work_hours_count"},
+            "late_count": {"$sum": "$late_count"},
+            "total_late_minutes": {"$sum": "$total_late_minutes"},
+            "leave_count": {"$sum": "$leave_count"},
+            "on_duty_count": {"$sum": "$on_duty_count"},
+        }},
+        {"$sort": {"_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "department": "$_id",
+            "headcount": 1,
+            "present_days": round_half_up("$present_days", 2),
+            # Mean over records (total hours / number of records), not a mean of per-employee means.
+            "avg_work_hours": {"$cond": [
+                {"$gt": ["$work_hours_count", 0]},
+                round_half_up({"$divide": ["$work_hours_sum", "$work_hours_count"]}, 2),
+                None,
+            ]},
+            "late_count": 1,
+            "total_late_minutes": 1,
+            "leave_count": 1,
+            "on_duty_count": 1,
+        }},
+    ]
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: MonthStr, department: Optional[str] = None):
+    items = list(db.employees.aggregate(department_summary_pipeline(month, department)))
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
