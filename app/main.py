@@ -9,6 +9,7 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated, Literal, Optional
@@ -47,6 +48,11 @@ def ensure_indexes() -> None:
     db.employees.create_index([("department", 1), ("emp_code", 1)])
     # Unique natural key of a record: makes concurrent punch-ins for the same day collide in the database.
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    # GET /attendance: sort is date desc, emp_code asc. Serves unfiltered lists and date-range filters,
+    # and month-range scans in the analytics pipelines.
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+    # GET /attendance?status=X: equality first, then the sort keys (ESR rule: Equality, Sort, Range).
+    db.attendance_logs.create_index([("status", 1), ("date", -1), ("emp_code", 1)])
 
 
 @asynccontextmanager
@@ -109,9 +115,9 @@ def shift_bounds(day: date, emp: dict) -> tuple[datetime, datetime]:
     return start, end
 
 
-def unprocessable(field: str, message: str):
-    """422 with the same body shape FastAPI uses for its own validation errors."""
-    return HTTPException(422, [{"type": "value_error", "loc": ["body", field], "msg": message}])
+def unprocessable(where: str, field: str, message: str):
+    """422 with the same body shape FastAPI uses for its own validation errors. `where` is "body", "query" or "path"."""
+    return HTTPException(422, [{"type": "value_error", "loc": [where, field], "msg": message}])
 
 
 def get_employee_or_404(emp_code: str) -> dict:
@@ -181,16 +187,23 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
 def _real_date(value: str) -> str:
+    if not DATE_RE.fullmatch(value):
+        raise ValueError("expected a date as YYYY-MM-DD")
     date.fromisoformat(value)  # raises ValueError for impossible dates such as 2026-02-30
     return value
 
 
 # Reusable constrained types. [0-9] instead of \d: \d also matches non-ASCII digits.
-DateStr = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"), AfterValidator(_real_date)]
+# DateStr validates inside a function (not Field(pattern=...)), so the same type works for body, query and path.
+DateStr = Annotated[str, AfterValidator(_real_date)]
 TimeHHMM = Annotated[str, Field(pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")]
 Page = Annotated[int, Query(ge=1)]
 PageSize = Annotated[int, Query(ge=1, le=100)]
+Status = Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
 
 
 class EmployeeCreate(BaseModel):
@@ -280,33 +293,46 @@ def punch_in(body: PunchInRequest):
     return serialize_record(doc)
 
 
+def build_attendance_query(
+    emp_code: Optional[str], date_from: Optional[str], date_to: Optional[str], status: Optional[str],
+    page: int, page_size: int,
+) -> dict:
+    """The find() spec for GET /attendance. Shared with /admin/explain so both run exactly the same query."""
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise unprocessable("query", "date_from", "date_from must be on or before date_to")
+    q = {}
+    if emp_code is not None:
+        q["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        q["date"] = {}
+        if date_from is not None:
+            q["date"]["$gte"] = date_from
+        if date_to is not None:
+            q["date"]["$lte"] = date_to
+    if status is not None:
+        q["status"] = status
+    return {
+        "filter": q,
+        "sort": [("date", -1), ("emp_code", 1)],
+        "skip": (page - 1) * page_size,
+        "limit": page_size,
+    }
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    page: Page = 1,
+    page_size: PageSize = 20,
 ):
-    q = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    spec = build_attendance_query(emp_code, date_from, date_to, status, page, page_size)
+    total = db.attendance_logs.count_documents(spec["filter"])
+    cursor = db.attendance_logs.find(spec["filter"]).sort(spec["sort"]).skip(spec["skip"]).limit(spec["limit"])
+    items = [serialize_record(doc) for doc in cursor]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
