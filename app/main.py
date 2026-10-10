@@ -10,12 +10,12 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
-from typing import Annotated, Optional
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import AfterValidator, BaseModel, Field, model_validator
+from pydantic import AfterValidator, BaseModel, Field, StrictInt, model_validator
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -34,6 +34,10 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 IST = timezone(timedelta(hours=5, minutes=30))
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+PRESENCE = ("PRESENT", "WFH", "ON_DUTY")
+STATUSES = ("PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE")
+GRACE_SECONDS = 10 * 60
+
 
 def ensure_indexes() -> None:
     """Create every index the app relies on. create_index is idempotent, so running it on every start is safe."""
@@ -41,6 +45,8 @@ def ensure_indexes() -> None:
     db.employees.create_index("emp_code", unique=True)
     # GET /employees?department=X sorted by emp_code: equality field first, then the sort field.
     db.employees.create_index([("department", 1), ("emp_code", 1)])
+    # Unique natural key of a record: makes concurrent punch-ins for the same day collide in the database.
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
 
 
 @asynccontextmanager
@@ -57,9 +63,62 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 # --------------------------------------------------------------------------- #
 def to_ms(dt: Optional[datetime]) -> Optional[int]:
     """Aware datetime -> epoch milliseconds (exact integer maths, no float rounding)."""
-    if dt is None:
+    if not isinstance(dt, datetime):
         return None
     return (dt - EPOCH) // timedelta(milliseconds=1)
+
+
+def to_utc(ms: int) -> datetime:
+    """Epoch milliseconds -> aware UTC datetime, truncated to whole seconds (R1)."""
+    return datetime.fromtimestamp(ms // 1000, tz=timezone.utc)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def parse_hhmm(value: str) -> time:
+    hours, minutes = map(int, value.split(":"))
+    return time(hours, minutes)
+
+
+def is_overnight(emp: dict) -> bool:
+    # "HH:MM" strings are zero-padded, so string comparison equals time comparison.
+    return emp["shift_end"] <= emp["shift_start"]
+
+
+def at_ist(day: date, hhmm: str) -> datetime:
+    """The instant that is `hhmm` IST on calendar day `day`."""
+    return datetime.combine(day, parse_hhmm(hhmm), tzinfo=IST)
+
+
+def attendance_date(punch_in: datetime, emp: dict) -> date:
+    """R1: the IST date of the punch-in; for an overnight shift, a punch-in before shift_end belongs to yesterday."""
+    local = punch_in.astimezone(IST)
+    if is_overnight(emp) and local.time() < parse_hhmm(emp["shift_end"]):
+        return local.date() - timedelta(days=1)
+    return local.date()
+
+
+def shift_bounds(day: date, emp: dict) -> tuple[datetime, datetime]:
+    """Start and end instants of the shift that starts on `day`. An overnight shift ends the next day."""
+    start = at_ist(day, emp["shift_start"])
+    end = at_ist(day, emp["shift_end"])
+    if is_overnight(emp):
+        end += timedelta(days=1)
+    return start, end
+
+
+def unprocessable(field: str, message: str):
+    """422 with the same body shape FastAPI uses for its own validation errors."""
+    return HTTPException(422, [{"type": "value_error", "loc": ["body", field], "msg": message}])
+
+
+def get_employee_or_404(emp_code: str) -> dict:
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    return emp
 
 
 def serialize_employee(doc: dict) -> dict:
@@ -76,11 +135,37 @@ def serialize_employee(doc: dict) -> dict:
     }
 
 
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def serialize_history(entry: dict) -> dict:
+    changes = {}
+    for field, change in (entry.get("changes") or {}).items():
+        if field in ("punch_in", "punch_out"):
+            changes[field] = {"from": to_ms(change.get("from")), "to": to_ms(change.get("to"))}
+        else:
+            changes[field] = {"from": change.get("from"), "to": change.get("to")}
+    return {"at": to_ms(entry.get("at")), "by": entry.get("by"), "reason": entry.get("reason"), "changes": changes}
+
+
+def serialize_record(doc: dict) -> dict:
+    """MongoDB attendance document -> API shape. Fills the defaults legacy documents may omit."""
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc.get("status"),
+        "punch_in": to_ms(doc.get("punch_in")),
+        "punch_out": to_ms(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes") or 0,
+        "overtime_minutes": doc.get("overtime_minutes") or 0,
+        "half_day": bool(doc.get("half_day") or False),
+        "history": [serialize_history(h) for h in doc.get("history") or []],
+    }
+
+
+def compute_late_minutes(punch_in: datetime, day: date, emp: dict) -> int:
+    """R2: late only if strictly more than 10:00 after shift start; then whole minutes since shift start."""
+    start, _ = shift_bounds(day, emp)
+    seconds = (punch_in - start) // timedelta(seconds=1)
+    return seconds // 60 if seconds > GRACE_SECONDS else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -124,10 +209,15 @@ class EmployeeCreate(BaseModel):
         return self
 
 
-class PunchInIn(BaseModel):
+# Epoch milliseconds. StrictInt rejects strings ("1783312500000"), floats (1.7e12) and booleans;
+# the lower bound rejects values that look like seconds.
+EpochMs = Annotated[StrictInt, Field(ge=100_000_000_000, le=4_102_444_800_000)]
+
+
+class PunchInRequest(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[EpochMs] = None
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #
@@ -166,28 +256,28 @@ def list_employees(department: Optional[str] = None, page: Page = 1, page_size: 
 
 
 @app.post("/attendance/punch-in", status_code=201)
-def punch_in(body: PunchInIn):
-    emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+def punch_in(body: PunchInRequest):
+    emp = get_employee_or_404(body.emp_code)
+    ts = to_utc(body.punched_at) if body.punched_at is not None else now_utc()
+    day = attendance_date(ts, emp)
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": day.isoformat(),
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, day, emp),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        # The unique (emp_code, date) index is the guard: of two simultaneous inserts, exactly one succeeds.
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return serialize_record(doc)
 
 
 @app.get("/attendance")

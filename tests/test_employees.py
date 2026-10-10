@@ -3,19 +3,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from tests.helpers import fire_in_parallel
+from tests.helpers import employee_body as employee, fire_in_parallel
 
-
-def employee(**overrides):
-    body = {
-        "emp_code": "EMP0001",
-        "name": "Asha Rao",
-        "email": "asha@example.com",
-        "department": "Engineering",
-        "joined_on": "2026-01-05",
-    }
-    body.update(overrides)
-    return body
 
 
 # --------------------------------------------------------------------------- #
