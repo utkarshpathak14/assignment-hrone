@@ -42,6 +42,8 @@ GRACE_SECONDS = 10 * 60
 MIN_OVERTIME_MINUTES = 30
 HALF_DAY_HOURS = 4.5
 MAX_SHIFT = timedelta(hours=24)
+# Fields a correction can change, in the order they appear in history[].changes.
+TRACKED_FIELDS = ("status", "punch_in", "punch_out", "work_hours", "late_minutes", "overtime_minutes", "half_day")
 
 
 def ensure_indexes() -> None:
@@ -87,6 +89,12 @@ def to_utc(ms: int) -> datetime:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def now_utc_ms() -> datetime:
+    """Now, at millisecond precision (what BSON can store), so the stored and returned values agree."""
+    now = datetime.now(timezone.utc)
+    return now.replace(microsecond=now.microsecond // 1000 * 1000)
 
 
 def parse_hhmm(value: str) -> time:
@@ -173,6 +181,19 @@ def serialize_record(doc: dict) -> dict:
     }
 
 
+def current_values(doc: dict) -> dict:
+    """The tracked fields of a stored record, with the defaults that missing legacy fields stand for."""
+    return {
+        "status": doc.get("status"),
+        "punch_in": doc.get("punch_in"),
+        "punch_out": doc.get("punch_out"),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes") or 0,
+        "overtime_minutes": doc.get("overtime_minutes") or 0,
+        "half_day": bool(doc.get("half_day") or False),
+    }
+
+
 def compute_late_minutes(punch_in: datetime, day: date, emp: dict) -> int:
     """R2: late only if strictly more than 10:00 after shift start; then whole minutes since shift start."""
     start, _ = shift_bounds(day, emp)
@@ -251,6 +272,23 @@ class EmployeeCreate(BaseModel):
 # Epoch milliseconds. StrictInt rejects strings ("1783312500000"), floats (1.7e12) and booleans;
 # the lower bound rejects values that look like seconds.
 EpochMs = Annotated[StrictInt, Field(ge=100_000_000_000, le=4_102_444_800_000)]
+
+
+class RegularizeRequest(BaseModel):
+    """Only these fields can be changed. Derived fields sent by a client are ignored (Pydantic drops unknown keys)."""
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def no_explicit_nulls(self):
+        # Omitting a field means "unchanged"; sending null is not a valid value for any of them.
+        for name in ("status", "punch_in", "punch_out"):
+            if name in self.model_fields_set and getattr(self, name) is None:
+                raise ValueError(f"{name} cannot be null")
+        return self
 
 
 class PunchOutRequest(BaseModel):
@@ -352,6 +390,58 @@ def punch_out(body: PunchOutRequest):
     )
     if updated is None:
         raise HTTPException(409, "already punched out")
+    return serialize_record(updated)
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: DateStr, body: RegularizeRequest):
+    emp = get_employee_or_404(emp_code)
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if record is None:
+        raise HTTPException(404, "no attendance record for that date")
+    day = datetime.fromisoformat(date).date()  # (the parameter `date` shadows the date class here)
+    old = current_values(record)
+
+    # 1. The final state after applying the request (omitted fields keep their stored value).
+    status = body.status if body.status is not None else old["status"]
+    if status in PRESENCE:
+        punch_in = to_utc(body.punch_in) if body.punch_in is not None else old["punch_in"]
+        punch_out = to_utc(body.punch_out) if body.punch_out is not None else old["punch_out"]
+        if punch_in is None:
+            raise unprocessable("body", "punch_in", "a presence status requires a punch_in")
+        if attendance_date(punch_in, emp) != day:
+            raise unprocessable("body", "punch_in", "punch_in must stay on the record's attendance date")
+        if punch_out is not None and (punch_out <= punch_in or punch_out - punch_in > MAX_SHIFT):
+            raise unprocessable("body", "punch_out", "punch_out must be after punch_in and within 24 hours")
+    else:
+        if body.punch_in is not None or body.punch_out is not None:
+            raise unprocessable("body", "status", f"{status} clears both punch times; do not send punch_in/punch_out")
+        punch_in = punch_out = None
+
+    # 2. Recompute the derived fields from the final times, then diff against what is stored.
+    new = {"status": status, "punch_in": punch_in, "punch_out": punch_out,
+           **derive(status, punch_in, punch_out, day, emp)}
+    changes = {f: {"from": old[f], "to": new[f]} for f in TRACKED_FIELDS if old[f] != new[f]}
+    if not changes:
+        raise unprocessable("body", "status", "the request changes nothing")
+
+    # 3. Optimistic concurrency: only write if the record still looks exactly as we read it (same times,
+    #    same status, same number of history entries). A concurrent edit makes the filter miss -> 409,
+    #    so no correction can silently overwrite another or lose its history entry.
+    entry = {"at": now_utc_ms(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "_id": record["_id"],
+            "status": record.get("status"),
+            "punch_in": record.get("punch_in"),
+            "punch_out": record.get("punch_out"),
+            "$expr": {"$eq": [{"$size": {"$ifNull": ["$history", []]}}, len(record.get("history") or [])]},
+        },
+        {"$set": new, "$push": {"history": entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "the record was changed by another request; reload and retry")
     return serialize_record(updated)
 
 
