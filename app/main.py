@@ -12,12 +12,13 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import AfterValidator, BaseModel, Field, StrictInt, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 # override=False (the default): a real environment variable always wins over a value in .env.
@@ -38,6 +39,9 @@ EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 PRESENCE = ("PRESENT", "WFH", "ON_DUTY")
 STATUSES = ("PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE")
 GRACE_SECONDS = 10 * 60
+MIN_OVERTIME_MINUTES = 30
+HALF_DAY_HOURS = 4.5
+MAX_SHIFT = timedelta(hours=24)
 
 
 def ensure_indexes() -> None:
@@ -48,6 +52,8 @@ def ensure_indexes() -> None:
     db.employees.create_index([("department", 1), ("emp_code", 1)])
     # Unique natural key of a record: makes concurrent punch-ins for the same day collide in the database.
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    # Punch-out: "this employee's latest record with punch_in <= t" = equality, then a range/sort on punch_in.
+    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
     # GET /attendance: sort is date desc, emp_code asc. Serves unfiltered lists and date-range filters,
     # and month-range scans in the analytics pipelines.
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
@@ -175,13 +181,33 @@ def compute_late_minutes(punch_in: datetime, day: date, emp: dict) -> int:
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    """R4: hours worked, rounded to 2 decimals half-up. Decimal avoids float and banker's rounding."""
+    seconds = (punch_out - punch_in) // timedelta(seconds=1)
+    hours = (Decimal(seconds) / Decimal(3600)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(hours)
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def compute_overtime(punch_out: datetime, day: date, emp: dict) -> int:
+    """R3: whole minutes after shift end, counted only from 30 minutes."""
+    _, end = shift_bounds(day, emp)
+    minutes = (punch_out - end) // timedelta(minutes=1)
+    return minutes if minutes >= MIN_OVERTIME_MINUTES else 0
+
+
+def derive(status: str, punch_in: Optional[datetime], punch_out: Optional[datetime], day: date, emp: dict) -> dict:
+    """The four derived fields for a record, per the DATA_MODEL table (R2-R5)."""
+    if status not in PRESENCE or punch_in is None:
+        return {"work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    late = compute_late_minutes(punch_in, day, emp)
+    if punch_out is None:
+        return {"work_hours": None, "late_minutes": late, "overtime_minutes": 0, "half_day": False}
+    work_hours = compute_work_hours(punch_in, punch_out)
+    return {
+        "work_hours": work_hours,
+        "late_minutes": late,
+        "overtime_minutes": compute_overtime(punch_out, day, emp),
+        "half_day": work_hours < HALF_DAY_HOURS,  # R5 compares the *rounded* hours
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +251,11 @@ class EmployeeCreate(BaseModel):
 # Epoch milliseconds. StrictInt rejects strings ("1783312500000"), floats (1.7e12) and booleans;
 # the lower bound rejects values that look like seconds.
 EpochMs = Annotated[StrictInt, Field(ge=100_000_000_000, le=4_102_444_800_000)]
+
+
+class PunchOutRequest(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
 
 
 class PunchInRequest(BaseModel):
@@ -279,10 +310,7 @@ def punch_in(body: PunchInRequest):
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
-        "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, day, emp),
-        "overtime_minutes": 0,
-        "half_day": False,
+        **derive(body.status, ts, None, day, emp),
         "history": [],
     }
     try:
@@ -291,6 +319,40 @@ def punch_in(body: PunchInRequest):
     except DuplicateKeyError:
         raise HTTPException(409, "already punched in for this date")
     return serialize_record(doc)
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutRequest):
+    emp = get_employee_or_404(body.emp_code)
+    ts = to_utc(body.punched_at) if body.punched_at is not None else now_utc()
+    # The most recent record that started at or before this punch-out. Works across midnight because it
+    # searches by instant, not by calendar date.
+    record = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}}, sort=[("punch_in", -1)]
+    )
+    if record is None:
+        raise HTTPException(404, "no punch-in found")
+    if record.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+    if ts <= record["punch_in"] or ts - record["punch_in"] > MAX_SHIFT:
+        raise unprocessable("body", "punched_at", "punch-out must be after punch-in and within 24 hours")
+
+    derived = derive(record["status"], record["punch_in"], ts, date.fromisoformat(record["date"]), emp)
+    # Atomic close: the filter only matches while punch_out is still null, so of two concurrent
+    # punch-outs exactly one update matches; the other gets None back.
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": record["_id"], "punch_out": None},
+        {"$set": {
+            "punch_out": ts,
+            "work_hours": derived["work_hours"],
+            "overtime_minutes": derived["overtime_minutes"],
+            "half_day": derived["half_day"],
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "already punched out")
+    return serialize_record(updated)
 
 
 def build_attendance_query(
