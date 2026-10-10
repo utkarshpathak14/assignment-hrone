@@ -15,6 +15,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
+from bson import Decimal128
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import AfterValidator, BaseModel, Field, StrictInt, model_validator
@@ -247,6 +248,17 @@ def _real_date(value: str) -> str:
 # Reusable constrained types. [0-9] instead of \d: \d also matches non-ASCII digits.
 # DateStr validates inside a function (not Field(pattern=...)), so the same type works for body, query and path.
 DateStr = Annotated[str, AfterValidator(_real_date)]
+MONTH_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
+
+
+def _real_month(value: str) -> str:
+    if not MONTH_RE.fullmatch(value):
+        raise ValueError("expected a month as YYYY-MM")
+    date.fromisoformat(f"{value}-01")  # rejects year 0000
+    return value
+
+
+MonthStr = Annotated[str, AfterValidator(_real_month)]
 TimeHHMM = Annotated[str, Field(pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")]
 Page = Annotated[int, Query(ge=1)]
 PageSize = Annotated[int, Query(ge=1, le=100)]
@@ -488,10 +500,127 @@ def list_attendance(
 
 
 # --------------------------------------------------------------------------- #
+# Analytics helpers
+#
+# Small functions that return MongoDB aggregation *expressions* (plain dicts), so every pipeline applies the
+# business rules the same way. `p` is the path prefix of a log's fields: "$" for a log document itself,
+# "$logs." for logs embedded by a $lookup.
+# --------------------------------------------------------------------------- #
+def month_bounds(month: str) -> tuple[date, date]:
+    first = date.fromisoformat(f"{month}-01")
+    next_first = date(first.year + first.month // 12, first.month % 12 + 1, 1)
+    return first, next_first - timedelta(days=1)
+
+
+def count_working_days(first: date, last: date) -> int:
+    """R7: Mon-Fri days from first to last inclusive (0 if first > last). Calendar arithmetic, not data."""
+    return sum(1 for i in range((last - first).days + 1) if (first + timedelta(days=i)).isoweekday() <= 5)
+
+
+def round_half_up_decimal(expr, places: int) -> dict:
+    """R8 half-up rounding inside MongoDB. ($round rounds half to even, so it can not be used.)
+    Works in Decimal128 so that 7.045 really is 7.045 and not 7.04499999..."""
+    factor = 10 ** places
+    return {"$divide": [{"$floor": {"$add": [{"$multiply": [{"$toDecimal": expr}, factor]}, Decimal128("0.5")]}},
+                        factor]}
+
+
+def round_half_up(expr, places: int) -> dict:
+    return {"$toDouble": round_half_up_decimal(expr, places)}
+
+
+def is_presence(p: str) -> dict:
+    return {"$in": [f"{p}status", list(PRESENCE)]}
+
+
+def is_weekday(date_string_expr) -> dict:
+    """True for Mon-Fri. `date_string_expr` resolves to a "YYYY-MM-DD" string."""
+    as_date = {"$dateFromString": {"dateString": date_string_expr, "format": "%Y-%m-%d"}}
+    return {"$lte": [{"$isoDayOfWeek": as_date}, 5]}
+
+
+def day_credit(p: str) -> dict:
+    """R5: a half day counts 0.5 of a present day. Missing half_day means false."""
+    return {"$cond": [{"$ifNull": [f"{p}half_day", False]}, 0.5, 1]}
+
+
+def present_days_credit(p: str) -> dict:
+    """R5-R7: presence-status records on Mon-Fri count 1 (or 0.5 for a half day); everything else 0."""
+    return {"$cond": [{"$and": [is_presence(p), is_weekday(f"{p}date")]}, day_credit(p), 0]}
+
+
+def late_of(p: str) -> dict:
+    return {"$ifNull": [f"{p}late_minutes", 0]}
+
+
+def count_if(condition) -> dict:
+    return {"$cond": [condition, 1, 0]}
+
+
+def month_match(month: str) -> dict:
+    first, last = month_bounds(month)
+    return {"$gte": first.isoformat(), "$lte": last.isoformat()}
+
+
+# --------------------------------------------------------------------------- #
+# Analytics endpoints
+# --------------------------------------------------------------------------- #
+def employee_monthly_spec(emp_code: str, month: str) -> tuple[dict, int, list]:
+    """(employee, working_days, pipeline on attendance_logs) for GET /analytics/employees/{emp_code}/monthly."""
+    emp = get_employee_or_404(emp_code)
+    first, last = month_bounds(month)
+    working_days = count_working_days(max(first, date.fromisoformat(emp["joined_on"])), last)
+    if working_days:
+        pct = round_half_up({"$divide": [{"$multiply": [{"$toDecimal": "$present_days"}, 100]}, working_days]}, 2)
+    else:
+        pct = {"$literal": None}
+    pipeline = [
+        {"$match": {"emp_code": emp_code, "date": month_match(month)}},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": present_days_credit("$")},
+            "leave_days": {"$sum": count_if({"$eq": ["$status", "LEAVE"]})},
+            "late_count": {"$sum": count_if({"$gt": [late_of("$"), 0]})},
+            "total_late_minutes": {"$sum": late_of("$")},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+        {"$project": {
+            "_id": 0,
+            "present_days": round_half_up("$present_days", 2),
+            "leave_days": 1,
+            "late_count": 1,
+            "total_late_minutes": 1,
+            "total_overtime_minutes": 1,
+            "attendance_pct": pct,
+        }},
+    ]
+    return emp, working_days, pipeline
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: MonthStr):
+    _, working_days, pipeline = employee_monthly_spec(emp_code, month)
+    rows = list(db.attendance_logs.aggregate(pipeline))
+    if rows:
+        stats = rows[0]
+    else:  # no records this month: $group emits nothing, so the zeros are filled in here
+        stats = {"present_days": 0, "leave_days": 0, "late_count": 0, "total_late_minutes": 0,
+                 "total_overtime_minutes": 0, "attendance_pct": 0.0 if working_days else None}
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": stats["present_days"],
+        "leave_days": stats["leave_days"],
+        "late_count": stats["late_count"],
+        "total_late_minutes": stats["total_late_minutes"],
+        "total_overtime_minutes": stats["total_overtime_minutes"],
+        "attendance_pct": stats["attendance_pct"],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
