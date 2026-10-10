@@ -8,6 +8,7 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -15,7 +16,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
-from bson import Decimal128
+from bson import Decimal128, json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import AfterValidator, BaseModel, Field, StrictInt, model_validator
@@ -53,6 +54,10 @@ def ensure_indexes() -> None:
     db.employees.create_index("emp_code", unique=True)
     # GET /employees?department=X sorted by emp_code: equality field first, then the sort field.
     db.employees.create_index([("department", 1), ("emp_code", 1)])
+    # Headcount (R9) = "joined_on <= end of period": the department summary without a department filter...
+    db.employees.create_index("joined_on")
+    # ...and with one, plus the trend's per-day headcount lookup (department equality, joined_on range).
+    db.employees.create_index([("department", 1), ("joined_on", 1)])
     # Unique natural key of a record: makes concurrent punch-ins for the same day collide in the database.
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     # Punch-out: "this employee's latest record with punch_in <= t" = equality, then a range/sort on punch_in.
@@ -831,6 +836,57 @@ def department_trend(
 
 
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
+# Admin
 # --------------------------------------------------------------------------- #
+def require(**params) -> None:
+    """422 in FastAPI's own shape for every required parameter that is missing."""
+    missing = [name for name, value in params.items() if value is None]
+    if missing:
+        raise HTTPException(422, [{"type": "missing", "loc": ["query", name], "msg": "Field required"}
+                                  for name in missing])
+
+
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard",
+                        "department_trend"]
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Optional[MonthStr] = None,
+    department: Optional[str] = None,
+    limit: Limit = 10,
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    from_: Annotated[Optional[DateStr], Query(alias="from")] = None,
+    to: Optional[DateStr] = None,
+    page: Page = 1,
+    page_size: PageSize = 20,
+):
+    """Runs explain (executionStats) on the endpoint's main query, built by the SAME function the endpoint uses."""
+    if endpoint == "attendance_list":
+        spec = build_attendance_query(emp_code, date_from, date_to, status, page, page_size)
+        collection = "attendance_logs"
+        command = {"find": collection, "filter": spec["filter"], "sort": dict(spec["sort"]),
+                   "skip": spec["skip"], "limit": spec["limit"]}
+    else:
+        if endpoint == "employee_monthly":
+            require(emp_code=emp_code, month=month)
+            collection, (_, _, pipeline) = "attendance_logs", employee_monthly_spec(emp_code, month)
+        elif endpoint == "department_summary":
+            require(month=month)
+            collection, pipeline = "employees", department_summary_pipeline(month, department)
+        elif endpoint == "late_leaderboard":
+            require(month=month)
+            collection, pipeline = "attendance_logs", late_leaderboard_pipeline(month, limit, department)
+        else:  # department_trend
+            require(department=department, **{"from": from_}, to=to)
+            first, last = trend_range(from_, to)
+            collection, pipeline = "employees", department_trend_pipeline(department, first, last)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+
+    raw = db.command("explain", command, verbosity="executionStats")
+    # BSON (dates, ObjectIds, Decimal128, Int64) -> plain JSON.
+    return {"endpoint": endpoint, "collection": collection, "explain": json.loads(json_util.dumps(raw))}
